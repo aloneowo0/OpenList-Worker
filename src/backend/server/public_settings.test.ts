@@ -17,6 +17,12 @@ const fetchSettings = async () => {
   return (await res.json()) as any
 }
 
+test("multipart settings are enabled with the default negotiated chunk size", async () => {
+  await seed([])
+  const json = await fetchSettings()
+  assert.equal(json.data.multipart_enabled, "true")
+  assert.equal(json.data.multipart_chunk_size, "10")
+})
 test("Security(C-1): /api/public/settings must never echo credential-shaped keys", async () => {
   await seed([
     { key: "token", value: "SUPER_SECRET_ADMIN_TOKEN" },

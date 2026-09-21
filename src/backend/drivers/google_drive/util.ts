@@ -306,6 +306,184 @@ export class GoogleDriveClient {
     )
   }
 
+  public async initResumableUpload(
+    parentId: string,
+    filename: string,
+    size: number,
+  ): Promise<string> {
+    const params = new URLSearchParams({
+      uploadType: "resumable",
+      supportsAllDrives: "true",
+      fields: "id,size,md5Checksum",
+    })
+    await this.ensureToken()
+    const res = await fetch(`${GDRIVE_UPLOAD_API}/files?${params.toString()}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+        "Content-Type": "application/json",
+        "X-Upload-Content-Type": "application/octet-stream",
+        "X-Upload-Content-Length": String(size),
+      },
+      body: JSON.stringify({ name: filename, parents: [parentId] }),
+    })
+    if (!res.ok)
+      throw new Error(
+        `[GoogleDrive] Resumable upload init failed: ${res.status}`,
+      )
+    const uploadUrl = res.headers.get("location")
+    if (!uploadUrl) throw new Error("[GoogleDrive] No upload URL returned")
+    return uploadUrl
+  }
+
+  private static uploadOffset(res: Response): number {
+    const range = res.headers.get("range")
+    if (!range) return 0
+    const match = /^bytes=0-(\d+)$/.exec(range.trim())
+    if (!match)
+      throw new Error(`[GoogleDrive] Invalid resumable Range header: ${range}`)
+    return Number(match[1]) + 1
+  }
+
+  private static async responseMetadata(
+    res: Response,
+  ): Promise<any | undefined> {
+    try {
+      return await res.json()
+    } catch {
+      return undefined
+    }
+  }
+
+  public async probeResumableUpload(
+    uploadUrl: string,
+    size: number,
+  ): Promise<{ receivedBytes: number; complete: boolean; metadata?: any }> {
+    await this.ensureToken()
+    const res = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+        "Content-Range": `bytes */${size}`,
+        "Content-Length": "0",
+      },
+    })
+    if (res.status === 308) {
+      return {
+        receivedBytes: GoogleDriveClient.uploadOffset(res),
+        complete: false,
+      }
+    }
+    if (res.status === 200 || res.status === 201) {
+      return {
+        receivedBytes: size,
+        complete: true,
+        metadata: await GoogleDriveClient.responseMetadata(res),
+      }
+    }
+    if (res.status === 404 || res.status === 410) {
+      throw new Error(
+        `[GoogleDrive] Resumable upload session expired (HTTP ${res.status})`,
+      )
+    }
+    const body = await res.text().catch(() => "")
+    throw new Error(
+      `[GoogleDrive] Resumable upload probe failed: ${res.status} ${body}`,
+    )
+  }
+
+  public async uploadResumableChunk(
+    uploadUrl: string,
+    chunk: Buffer,
+    start: number,
+    size: number,
+  ): Promise<{ receivedBytes: number; complete: boolean; metadata?: any }> {
+    if (chunk.length <= 0)
+      throw new Error("[GoogleDrive] Empty resumable chunk")
+    const end = start + chunk.length
+    const before = await this.probeResumableUpload(uploadUrl, size)
+    if (before.receivedBytes >= end) return before
+    if (before.complete) {
+      throw new Error(
+        "[GoogleDrive] Completed session does not cover the current chunk",
+      )
+    }
+    if (before.receivedBytes > start) {
+      throw new Error(
+        "[GoogleDrive] Resumable upload offset is inside the current chunk",
+      )
+    }
+    if (before.receivedBytes < start) {
+      throw new Error(
+        "[GoogleDrive] Resumable upload has a gap before the current chunk",
+      )
+    }
+
+    const recoverAmbiguous = async (original: Error) => {
+      try {
+        const after = await this.probeResumableUpload(uploadUrl, size)
+        if (after.complete || after.receivedBytes >= end) return after
+      } catch {}
+      throw original
+    }
+
+    let res: Response
+    try {
+      res = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+          "Content-Range": `bytes ${start}-${end - 1}/${size}`,
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(chunk.length),
+        },
+        body: chunk as unknown as BodyInit,
+      })
+    } catch (error) {
+      return recoverAmbiguous(
+        error instanceof Error ? error : new Error(String(error)),
+      )
+    }
+
+    if (res.status === 404 || res.status === 410) {
+      throw new Error(
+        `[GoogleDrive] Resumable upload session expired (HTTP ${res.status})`,
+      )
+    }
+    if (res.status >= 500 && res.status <= 599) {
+      const body = await res.text().catch(() => "")
+      return recoverAmbiguous(
+        new Error(`[GoogleDrive] Chunk upload failed: ${res.status} ${body}`),
+      )
+    }
+    if (res.status === 308) {
+      const receivedBytes = GoogleDriveClient.uploadOffset(res)
+      if (end === size) {
+        throw new Error("[GoogleDrive] Final resumable chunk did not complete")
+      }
+      if (receivedBytes !== end) {
+        throw new Error(
+          `[GoogleDrive] Resumable chunk Range ended at ${receivedBytes}, expected ${end}`,
+        )
+      }
+      return { receivedBytes, complete: false }
+    }
+    if (res.status === 200 || res.status === 201) {
+      if (end !== size) {
+        throw new Error(
+          "[GoogleDrive] Non-final resumable chunk completed the session",
+        )
+      }
+      return {
+        receivedBytes: size,
+        complete: true,
+        metadata: await GoogleDriveClient.responseMetadata(res),
+      }
+    }
+    const body = await res.text().catch(() => "")
+    throw new Error(`[GoogleDrive] Chunk upload failed: ${res.status} ${body}`)
+  }
+
   public async putFile(
     parentId: string,
     filename: string,

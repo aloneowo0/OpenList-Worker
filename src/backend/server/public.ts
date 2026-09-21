@@ -345,6 +345,8 @@ publicRouter.get("/settings", async (c) => {
     // 后端类型标识：前端据此在 GO / TS 模式间切换功能开关。
     // Go 版 OpenList 后端不返回此字段，前端缺省视为 "go"。
     backend: "ts-worker",
+    multipart_enabled: "true",
+    multipart_chunk_size: "10",
     announcement: "",
     pagination_type: "pagination",
     default_page_size: "20",

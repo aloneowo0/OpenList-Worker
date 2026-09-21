@@ -1389,8 +1389,7 @@ fsRouter.post("/multipart/init", async (c) => {
       return c.json({ code: 200, message: "success", data: null })
     }
 
-    const chunkSize = clampChunkSize(rawChunk)
-    const totalChunks = Math.max(1, Math.ceil(size / chunkSize))
+    const fallbackChunkSize = clampChunkSize(rawChunk)
 
     // 断点续传：同 path+size 的未完成会话直接复用
     let session: MultipartSession
@@ -1407,6 +1406,42 @@ fsRouter.post("/multipart/init", async (c) => {
         size,
         md5,
       )
+      const returnedChunkSize = Number(info?.chunkSize)
+      const chunkSize =
+        Number.isInteger(returnedChunkSize) && returnedChunkSize > 0
+          ? returnedChunkSize
+          : fallbackChunkSize
+      const returnedPartCount = Number(info?.partCount)
+      const totalChunks =
+        Number.isInteger(returnedPartCount) && returnedPartCount > 0
+          ? returnedPartCount
+          : Math.max(1, Math.ceil(size / chunkSize))
+      if (!info?.reuse) {
+        const maxPart = getUploadSizeLimit(c, true)
+        if (chunkSize < 1 * 1024 * 1024) {
+          throw new Error("negotiated chunk size is below 1 MiB")
+        }
+        if (chunkSize > maxPart) {
+          await flushPendingDriverState(
+            resolved.storage!.driver,
+            resolved.storage,
+            driver,
+            requestContext,
+          )
+          return c.json(
+            {
+              code: 413,
+              message: `Negotiated chunk too large (max ${maxPart} bytes)`,
+              data: null,
+            },
+            413,
+          )
+        }
+        if (totalChunks !== Math.max(1, Math.ceil(size / chunkSize))) {
+          throw new Error("invalid negotiated part count")
+        }
+        if (!info?.session) throw new Error("missing upload session token")
+      }
       session = {
         upload_id: newUploadId(),
         state: "receiving",
@@ -1419,6 +1454,7 @@ fsRouter.post("/multipart/init", async (c) => {
         driver_session: info?.session || "",
         partMd5s: new Array(totalChunks).fill(undefined),
         storage_driver: resolved.storage!.driver,
+        sequential_parts: info?.sequentialParts === true,
         created_at: Date.now(),
       }
       // 秒传：驱动返回 reuse 标记
@@ -1469,12 +1505,41 @@ fsRouter.put("/multipart/chunk", async (c) => {
     return c.json({ code: 200, message: "success", data: mpSnapshot(session) })
   }
 
+  let frontier = 0
+  while (session.received.has(frontier)) frontier++
+  if (
+    session.sequential_parts &&
+    (chunkIndex !== frontier || session.active_chunk !== undefined)
+  ) {
+    return c.json(
+      { code: 409, message: "expected next chunk", data: mpSnapshot(session) },
+      409,
+    )
+  }
+
   const tooLarge = exceedsUploadLimit(c, true)
   if (tooLarge !== null) {
     return c.json(
       { code: 413, message: `Part too large (max ${tooLarge} bytes)`, data: null },
       413,
     )
+  }
+
+  const expectedLength = Math.min(
+    session.chunk_size,
+    session.size - chunkIndex * session.chunk_size,
+  )
+  const contentLength = c.req.header("Content-Length")
+  if (contentLength !== undefined && parseInt(contentLength, 10) !== expectedLength) {
+    return c.json(
+      { code: 400, message: `Invalid chunk length (expected ${expectedLength} bytes)`, data: null },
+      400,
+    )
+  }
+
+  if (session.sequential_parts) {
+    session.active_chunk = chunkIndex
+    putSession(session)
   }
 
   const requestContext = getStorageRequestContext(c)
@@ -1488,6 +1553,12 @@ fsRouter.put("/multipart/chunk", async (c) => {
       throw new Error("storage does not support chunked upload")
     }
     const buffer = Buffer.from(await c.req.arrayBuffer())
+    if (buffer.length !== expectedLength) {
+      return c.json(
+        { code: 400, message: `Invalid chunk length (expected ${expectedLength} bytes)`, data: null },
+        400,
+      )
+    }
     let result
     try {
       result = await (driver as any).uploadPart(
@@ -1509,6 +1580,11 @@ fsRouter.put("/multipart/chunk", async (c) => {
     return c.json({ code: 200, message: "success", data: mpSnapshot(session) })
   } catch (e: any) {
     return c.json({ code: 500, message: safeErrorMessage(e), data: null }, 500)
+  } finally {
+    if (session.sequential_parts) {
+      session.active_chunk = undefined
+      putSession(session)
+    }
   }
 })
 
@@ -1526,6 +1602,18 @@ fsRouter.post("/multipart/complete", async (c) => {
   }
   if (session.state === "completed") {
     return c.json({ code: 200, message: "success", data: mpSnapshot(session) })
+  }
+  for (let i = 0; i < session.total_chunks; i++) {
+    if (!session.received.has(i)) {
+      return c.json(
+        {
+          code: 409,
+          message: "missing multipart chunks",
+          data: mpSnapshot(session),
+        },
+        409,
+      )
+    }
   }
 
   const requestContext = getStorageRequestContext(c)

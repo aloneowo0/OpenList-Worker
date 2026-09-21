@@ -36,6 +36,8 @@ export interface MultipartSession {
   partMd5s: (string | undefined)[]
   /** 驱动名 + 存储引用，用于 chunk/complete 时重新 resolve 驱动 */
   storage_driver: string
+  sequential_parts?: boolean
+  active_chunk?: number
   created_at: number
   error?: string
 }
@@ -88,7 +90,13 @@ function intervalsOf(set: Set<number>): [number, number][] {
 
 export function snapshot(s: MultipartSession): MultipartSnapshot {
   const intervals = intervalsOf(s.received)
-  const receivedBytes = s.received.size * s.chunk_size
+  let receivedBytes = 0
+  for (const index of s.received) {
+    receivedBytes += Math.min(
+      s.chunk_size,
+      Math.max(0, s.size - index * s.chunk_size),
+    )
+  }
   // frontier：连续已收的最大 index + 1（驱动顺序写入进度）
   let frontier = 0
   for (let i = 0; i < s.total_chunks; i++) {
